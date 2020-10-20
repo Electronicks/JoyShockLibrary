@@ -10,12 +10,14 @@
 #include "tools.cpp"
 #include <cstring>
 #include <array> // same as [] but with vector accessors
+#include "steam_controller/steam_controller.hpp"
+
 
 #ifdef __GNUC__
 #define _wcsdup wcsdup
 #endif
 
-enum ControllerType { n_switch, s_ds4, s_ds };
+enum ControllerType { n_switch, s_ds4, s_ds, s_sc };
 
 // PS5 stuff
 #define DS_VENDOR 0x054C
@@ -51,38 +53,262 @@ typedef struct GYRO_AVERAGE_WINDOW {
 	int numSamples;
 } GYRO_AVERAGE_WINDOW;
 
-class JoyShock {
-
+class Controller {
 public:
-
+	std::string name;
 	hid_device * handle;
 	int intHandle = 0;
-	wchar_t *serial;
-
-	std::string name;
-
+	bool is_ds4 = false;
+	bool is_usb = false; // it's ds4_bt because joycons aren't using that distinction (yet?)
 	int deviceNumber = 0;// left(0) or right(1) vjoy
-
 	int left_right = 0;// 1: left joycon, 2: right joycon, 3: pro controller
-
-	std::chrono::steady_clock::time_point last_polled;
+	int player_number = 0;
+	bool cancel_thread = false;
+	std::thread* thread;
+	bool cue_motion_reset = false;
+	// for calibration:
+	bool use_continuous_calibration = false;
+	Motion motion;
+	float accel_magnitude = 1.0f;
 	float delta_time = 1.0;
-
-	JOY_SHOCK_STATE simple_state = {};
-	JOY_SHOCK_STATE last_simple_state = {};
+	std::chrono::steady_clock::time_point last_polled;
+	int global_count = 0;
+	ControllerType controller_type = ControllerType::n_switch;
 
 	IMU_STATE imu_state = {};
 	IMU_STATE last_imu_state = {};
 
+	JOY_SHOCK_STATE simple_state = {};
+	JOY_SHOCK_STATE last_simple_state = {};
+
 	std::array<TOUCH_POINT, 2> touch_point; // Send point to the callbacks
 	std::array<TOUCH_STATE, 2> prev_touch_state; // Hold the prev state info
 
-	Motion motion;
+	uint16_t stick_cal_x_l[0x3];
+	uint16_t stick_cal_y_l[0x3];
+	uint16_t stick_cal_x_r[0x3];
+	uint16_t stick_cal_y_r[0x3];
+
+	float offset_x = 0.0f;
+	float offset_y = 0.0f;
+	float offset_z = 0.0f;
+
+	// for continuous calibration
+	static const int num_gyro_average_windows = 16;
+	int gyro_average_window_front_index = 0;
+	int gyro_average_window_seconds = 600; // TODO: Function to set this for this device and for all devices. Different players might have different settings
+	GYRO_AVERAGE_WINDOW gyro_average_window[num_gyro_average_windows];
+
+	unsigned char led_r = 0;
+	unsigned char led_g = 0;
+	unsigned char led_b = 0;
+	unsigned int body_colour = 0xFFFFFF;
+
+	unsigned char small_rumble = 0;
+	unsigned char big_rumble = 0;
+
+	virtual bool init_usb() = 0;
+	virtual bool init_bt() = 0;
+	virtual void init_ds4_bt() = 0;
+	virtual void init_ds4_usb() = 0;
+	virtual void deinit_ds4_bt() = 0;
+	virtual void deinit_ds4_usb() = 0;
+	virtual void deinit_usb() = 0;
+	virtual void enable_IMU(unsigned char *buf, int bufLength) = 0;
+	bool hid_exchange(hid_device *handle, unsigned char *buf, int len) {
+		if (!handle) return false;
+
+		int res;
+
+		res = hid_write(handle, buf, len);
+
+		res = hid_read_timeout(handle, buf, 0x40, 1000);
+		if (res == 0)
+		{
+			return false;
+		}
+		return true;
+	}
+	virtual bool send_subcommand(int command, int subcommand, uint8_t *data, int len) {
+		unsigned char buf[0x40];
+		memset(buf, 0, 0x40);
+
+		uint8_t rumble_base[9] = { std::uint8_t((++global_count) & 0xF), 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40 };
+		memcpy(buf, rumble_base, 9);
+
+		if (global_count > 0xF) {
+			global_count = 0x0;
+		}
+
+		// set neutral rumble base only if the command is vibrate (0x01)
+		// if set when other commands are set, might cause the command to be misread and not executed
+		//if (subcommand == 0x01) {
+		//	uint8_t rumble_base[9] = { (++global_count) & 0xF, 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40 };
+		//	memcpy(buf + 10, rumble_base, 9);
+		//}
+
+		buf[9] = subcommand;
+		if (data && len != 0) {
+			memcpy(buf + 10, data, len);
+		}
+
+		if (!send_command(command, buf, 10 + len))
+		{
+			return false;
+		}
+
+		if (data) {
+			memcpy(data, buf, 0x40); //TODO
+		}
+		return true;
+	}
+	bool send_command(int command, uint8_t *data, int len) {
+		unsigned char buf[0x40];
+		memset(buf, 0, 0x40);
+
+		if (is_usb) {
+			buf[0x00] = 0x80;
+			buf[0x01] = 0x92;
+			buf[0x03] = 0x31;
+		}
+
+		buf[is_usb ? 0x8 : 0x0] = command;
+		if (data != nullptr && len != 0) {
+			memcpy(buf + (is_usb ? 0x9 : 0x1), data, len);
+		}
+
+		if (!hid_exchange(this->handle, buf, len + (is_usb ? 0x9 : 0x1)))
+		{
+			return false;
+		}
+
+		if (data) {
+			memcpy(data, buf, 0x40);
+		}
+		return true;
+	}
+
+	int get_gyro_average_window_total_samples_for_device() {
+		if (this->is_ds4) {
+			// 250 samples per second
+			return 250 * this->gyro_average_window_seconds;
+		}
+		// 67 samples per second
+		return 67 * this->gyro_average_window_seconds;
+	}
+
+
+	int get_gyro_average_window_single_samples_for_device() {
+		return get_gyro_average_window_total_samples_for_device() / (num_gyro_average_windows - 2);
+	}
+
+
+	void push_sensor_samples(float x, float y, float z, float accelMagnitude) {
+		// push samples
+		GYRO_AVERAGE_WINDOW* windowPointer = this->gyro_average_window + this->gyro_average_window_front_index;
+		if (windowPointer->numSamples >= get_gyro_average_window_single_samples_for_device()) {
+			// next
+			this->gyro_average_window_front_index = (this->gyro_average_window_front_index + num_gyro_average_windows - 1) % num_gyro_average_windows;
+			this->gyro_average_window[this->gyro_average_window_front_index] = {};
+			windowPointer = this->gyro_average_window + this->gyro_average_window_front_index;
+		}
+		// accumulate
+		windowPointer->numSamples++;
+		windowPointer->x += x;
+		windowPointer->y += y;
+		windowPointer->z += z;
+		windowPointer->accelMagnitude += accelMagnitude;
+	}
+
+	void get_average_gyro(float& x, float& y, float& z, float& accelMagnitude) {
+		float weight = 0.0f;
+		float totalX = 0.0f;
+		float totalY = 0.0f;
+		float totalZ = 0.0f;
+		float totalAccelMagnitude = 0.0f;
+		int samplesAccumulated = 0;
+		int samplesWanted = this->get_gyro_average_window_total_samples_for_device();
+		float samplesPerWindow = (float)(this->get_gyro_average_window_single_samples_for_device());
+		//int numSamplesAvailable = 0;
+		//for (int i = 0; i < num_gyro_average_windows && samplesWanted > 0; i++) {
+		//	numSamplesAvailable += this->gyro_average_window[i].numSamples;
+		//}
+
+		// get the average of each window
+		// and a weighted average of all those averages, weighted by the number of samples it has compared to how many samples a full window will have.
+		// this isn't a perfect rolling average. the last window, which has more samples than we need, will have its contribution weighted according to how many samples it would ideally have for the current span of time.
+		for (int i = 0; i < num_gyro_average_windows && samplesWanted > 0; i++) {
+			int cycledIndex = (i + this->gyro_average_window_front_index) % num_gyro_average_windows;
+			GYRO_AVERAGE_WINDOW* windowPointer = this->gyro_average_window + cycledIndex;
+			if (windowPointer->numSamples == 0)
+			{
+				continue;
+			}
+			float thisWeight = 1.0f;
+			float fNumSamples = (float)(windowPointer->numSamples);
+			if (samplesWanted < windowPointer->numSamples)
+			{
+				thisWeight = ((float)(samplesWanted)) / windowPointer->numSamples;
+				samplesWanted = 0;
+			}
+			else
+			{
+				thisWeight = fNumSamples / samplesPerWindow;
+				samplesWanted -= windowPointer->numSamples;
+			}
+
+			//printf("[%.1f] [%d] [%.1f]; ", \
+						//	windowPointer->y,
+//	(int)fNumSamples,
+//	thisWeight);
+
+			totalX += (windowPointer->x / fNumSamples) * thisWeight;
+			totalY += (windowPointer->y / fNumSamples) * thisWeight;
+			totalZ += (windowPointer->z / fNumSamples) * thisWeight;
+			totalAccelMagnitude += (windowPointer->accelMagnitude / fNumSamples) * thisWeight;
+			weight += thisWeight;
+		}
+		if (weight > 0.0) {
+			x = totalX / weight;
+			y = totalY / weight;
+			z = totalZ / weight;
+			accelMagnitude = totalAccelMagnitude / weight;
+		}
+		//printf("{%.1f, %.1f, %.1f} {%d}\n", x, y, z, numSamplesAvailable);
+		//printf("{%.1f} {%d}\n", y, numSamplesAvailable);
+	}
+
+	virtual void reset_continuous_calibration()
+	{
+		for (int i = 0; i < num_gyro_average_windows; i++) {
+			this->gyro_average_window[i] = {};
+		}
+	}
+	virtual void set_ds4_rumble_light(unsigned char smallRumble, unsigned char bigRumble,
+		unsigned char colourR,
+		unsigned char colourG,
+		unsigned char colourB) = 0;
+
+	MOTION_STATE get_motion_state()
+	{
+		return motion.GetMotionState();
+	}
+
+	Controller(int uniqueHandle)
+		: intHandle(uniqueHandle)
+	{
+
+	}
+};
+
+class JoyShock : public Controller {
+
+public:
+
+	wchar_t *serial;
 
 	int8_t dstick;
 	uint8_t battery;
-
-	int global_count = 0;
 
 	// calibration data:
 	struct brcm_hdr {
@@ -107,8 +333,8 @@ public:
 	bool has_user_cal_stick_r = false;
 	bool has_user_cal_sensor = false;
 
-	ControllerType controller_type = ControllerType::n_switch;
-	bool is_usb = false;
+	bool is_ds4 = false;
+	bool is_usb = false; // it's ds4_bt because joycons aren't using that distinction (yet?)
 
 	unsigned char small_rumble = 0;
 	unsigned char big_rumble = 0;
@@ -120,26 +346,7 @@ public:
 	unsigned int button_colour = 0xFFFFFF;
 	unsigned int left_grip_colour = 0xFFFFFF;
 	unsigned int right_grip_colour = 0xFFFFFF;
-
-	int player_number = 0;
-
-	bool cancel_thread = false;
-	std::thread* thread;
-
-	// for calibration:
-	bool use_continuous_calibration = false;
-	bool cue_motion_reset = false;
-	float offset_x = 0.0f;
-	float offset_y = 0.0f;
-	float offset_z = 0.0f;
-	float accel_magnitude = 1.0f;
-
-	// for continuous calibration
-	static const int num_gyro_average_windows = 16;
-	int gyro_average_window_front_index = 0;
-	int gyro_average_window_seconds = 600; // TODO: Function to set this for this device and for all devices. Different players might have different settings
-	GYRO_AVERAGE_WINDOW gyro_average_window[num_gyro_average_windows];
-
+	
 	unsigned char factory_stick_cal[0x12];
 	unsigned char device_colours[0xC];
 	unsigned char user_stick_cal[0x16];
@@ -150,10 +357,6 @@ public:
 	uint16_t factory_sensor_cal_calm[0xC];
 	uint16_t user_sensor_cal_calm[0xC];
 	int16_t sensor_cal[0x2][0x3];
-	uint16_t stick_cal_x_l[0x3];
-	uint16_t stick_cal_y_l[0x3];
-	uint16_t stick_cal_x_r[0x3];
-	uint16_t stick_cal_y_r[0x3];
 
 	//uint32_t crc_table[256] = {
 	//	0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
@@ -282,7 +485,9 @@ public:
 	}
 
 public:
-	JoyShock(struct hid_device_info *dev, int uniqueHandle) {
+	JoyShock(struct hid_device_info *dev, int uniqueHandle)
+		: Controller(uniqueHandle)
+	{
 
 		if (dev->product_id == JOYCON_CHARGING_GRIP) {
 
@@ -329,7 +534,6 @@ public:
 		}
 
 		this->serial = _wcsdup(dev->serial_number);
-		this->intHandle = uniqueHandle;
 
 		//printf("Found device %c: %ls %s\n", L_OR_R(this->left_right), this->serial, dev->path);
 		this->handle = hid_open_path(dev->path);
@@ -363,7 +567,7 @@ public:
 	}
 
 	int get_gyro_average_window_total_samples_for_device() {
-		if (this->controller_type == ControllerType::s_ds4) {
+		if (this->is_ds4) {
 			// 250 samples per second
 			return 250 * this->gyro_average_window_seconds;
 		}
@@ -737,7 +941,7 @@ public:
 		return true;
 	}
 
-	void enable_IMU(unsigned char *buf, int bufLength) {
+	void enable_IMU(unsigned char *buf, int bufLength) override {
 		memset(buf, 0, bufLength);
 
 		// Enable IMU data
@@ -761,7 +965,7 @@ public:
 		}
 	}
 
-	bool init_usb() {
+	bool init_usb() override {
 		unsigned char buf[0x400];
 		memset(buf, 0, 0x400);
 
@@ -836,7 +1040,7 @@ public:
 		return result;
 	}
 
-	bool init_bt() {
+	bool init_bt() override {
 		bool result = true;
 		unsigned char buf[0x40];
 		memset(buf, 0, 0x40);
@@ -915,7 +1119,7 @@ public:
 		return result;
 	}
 
-	void init_ds4_bt() {
+	void init_ds4_bt() override {
 		printf("initialise, set colour\n");
 		unsigned char buf[78];
 		memset(buf, 0, 78);
@@ -1061,7 +1265,7 @@ public:
 	}
 
 	// this is mostly copied from init_usb() below, but modified to speak DS4
-	void init_ds4_usb() {
+	void init_ds4_usb() override {
 		unsigned char buf[31];
 		memset(buf, 0, 31);
 
@@ -1179,7 +1383,7 @@ public:
 	void set_ds4_rumble_light(unsigned char smallRumble, unsigned char bigRumble,
 		unsigned char colourR,
 		unsigned char colourG,
-		unsigned char colourB) {
+		unsigned char colourB) override {
 		if (!is_usb) {
 			set_ds4_rumble_light_bt(smallRumble, bigRumble, colourR, colourG, colourB);
 		}
@@ -1371,5 +1575,169 @@ public:
 
 		return 0;
 
+	}
+};
+
+class SteamController : public Controller {
+public:
+	static steam_controller::context _scContext;
+
+	std::unique_ptr<steam_controller::controller> _sc;
+
+	SteamController(std::unique_ptr<steam_controller::controller> &sc, int uniqueHandle, bool wireless)
+		: Controller(uniqueHandle)
+		, _sc(std::move(sc))
+	{
+		is_ds4 = true;
+		left_right = 3;
+
+		name = std::string("Steam Controller");
+		is_usb = !wireless;
+
+		// initialise continuous calibration windows
+		reset_continuous_calibration();
+	}
+
+	bool init_usb() { throw std::exception("Not Implemented"); }
+	bool init_bt() { throw std::exception("Not Implemented"); }
+	void init_ds4_bt() { throw std::exception("Not Implemented"); }
+	void init_ds4_usb() { throw std::exception("Not Implemented"); }
+	void deinit_ds4_bt() { throw std::exception("Not Implemented"); };
+	void deinit_ds4_usb() { throw std::exception("Not Implemented"); };
+	void deinit_usb() { throw std::exception("Not Implemented"); };
+	void enable_IMU(unsigned char *reportData, int bufLength) override
+	{
+		memset(reportData, 0, bufLength);
+
+		// Enable IMU data
+		reportData[1] = 0x87; // 0x87 = register write command
+		reportData[2] = 0x03; // 0x03 = length of data to be written (data + 1 empty bit)
+		reportData[3] = 0x30; // 0x30 = register of Gyro data
+		reportData[4] = 0x10 | 0x08 | 0x04; // enable raw Gyro, raw Accel, and Quaternion data
+		_sc->send_feature(reportData, bufLength);
+		// Display result?
+	};
+
+	//bool send_subcommand(int command, int subcommand, uint8_t *data, int len) { throw std::exception("Not Implemented"); };
+	void set_ds4_rumble_light(unsigned char smallRumble, unsigned char bigRumble,
+		unsigned char colourR,
+		unsigned char colourG,
+		unsigned char colourB) {
+		throw std::exception("Not Implemented");
+	};
+
+	void update(steam_controller::update_event update, bool &hasIMU)
+	{
+		using namespace steam_controller;
+		simple_state.buttons = 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::X) ? JSMASK_W : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::Y) ? JSMASK_N : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::A) ? JSMASK_S : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::B) ? JSMASK_E : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::RPAD) ? JSMASK_RCLICK : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::NEXT) ? JSMASK_OPTIONS : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::PREV) ? JSMASK_SHARE : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::RS) ? JSMASK_R : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::LS) ? JSMASK_L : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::HOME) ? JSMASK_PS : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::LT) ? JSMASK_ZL : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::RT) ? JSMASK_ZR : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::LG) ? JSMASK_SL : 0;
+		simple_state.buttons |= update.buttons & uint32_t(Button::RG) ? JSMASK_SR : 0;
+		
+		simple_state.rTrigger = update.right_trigger / float(UCHAR_MAX);
+		simple_state.lTrigger = update.left_trigger / float(UCHAR_MAX);
+				
+		simple_state.stickRX = (std::fmin)(1.0, update.right_axis.x / float(INT16_MAX));
+		simple_state.stickRY = (std::fmin)(1.0, update.right_axis.y / float(INT16_MAX));
+
+		if (update.buttons & uint32_t(Button::LFINGER))
+		{
+			// Pad data
+			simple_state.buttons |= update.buttons & uint32_t(Button::STICK) ? JSMASK_TOUCHPAD_CLICK : 0; // Same as CAPTURE
+			// Divinding by 3 creates a 3x3 grid of equal size areas
+			simple_state.buttons |= update.left_axis.y < (INT16_MIN/3) ? JSMASK_DOWN : 0;
+			simple_state.buttons |= update.left_axis.y > (INT16_MAX/3) ? JSMASK_UP : 0;
+			simple_state.buttons |= update.left_axis.x > (INT16_MAX/3) ? JSMASK_RIGHT : 0;
+			simple_state.buttons |= update.left_axis.x < (INT16_MIN/3) ? JSMASK_LEFT : 0;
+		}
+		else
+		{
+			// stick data
+			simple_state.stickLX = (std::fmin)(1.0, update.left_axis.x / float(INT16_MAX));
+			simple_state.stickLY = (std::fmin)(1.0, update.left_axis.y / float(INT16_MAX));
+			simple_state.buttons |= update.buttons & uint32_t(Button::STICK) ? JSMASK_LCLICK : 0;
+		}
+		
+		// Gyroscope:
+		int16_t gyroSampleX = update.angular_velocity.x;
+		int16_t gyroSampleY = update.angular_velocity.y;
+		int16_t gyroSampleZ = update.angular_velocity.z;
+		int16_t accelSampleX = update.acceleration.x;
+		int16_t accelSampleY = update.acceleration.y;
+		int16_t accelSampleZ = update.acceleration.z;
+
+		if ((gyroSampleX | gyroSampleY | gyroSampleZ | accelSampleX | accelSampleY | accelSampleZ) == 0)
+		{
+			// all zero?
+			hasIMU = false;
+		}
+
+		// convert to real units TODO: fic magic numbers
+		imu_state.gyroX = (float)(gyroSampleX) * (2000.0 / 32767.0);
+		imu_state.gyroY = (float)(gyroSampleY) * (2000.0 / 32767.0);
+		imu_state.gyroZ = (float)(gyroSampleZ) * (2000.0 / 32767.0);
+
+		imu_state.accelX = (float)(accelSampleX) / 8192.0;
+		imu_state.accelY = (float)(accelSampleY) / 8192.0;
+		imu_state.accelZ = (float)(accelSampleZ) / 8192.0;
+
+		//printf("SC accel: %.4f, %.4f, %.4f\n", imu_state.accelX, imu_state.accelY, imu_state.accelZ);
+
+		//printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d\n",
+		//	gyro.yaw, gyro.pitch, gyro.roll, accel.x, accel.y, accel.z, universal_counter++);
+
+		// Touchpad:
+		std::array<TOUCH_STATE, 2> current;
+
+		current[0].tDown = update.buttons & int(Button::LFINGER);
+		current[0].tId = int(Button::LPAD);
+		current[0].tX = (update.left_axis.x - INT16_MIN) / float(UINT16_MAX);
+		current[0].tY = 1 - (update.left_axis.y - INT16_MIN) / float(UINT16_MAX);
+
+		current[1].tDown = update.buttons & int(Button::RFINGER);
+		current[1].tId = int(Button::RPAD);
+		current[1].tX = (update.right_axis.x - INT16_MIN) / float(UINT16_MAX);
+		current[1].tY = 1 - (update.right_axis.y - INT16_MIN) / float(UINT16_MAX);
+
+		printf("SC touch: %d, %d, %d, %d, %.4f, %.4f, %.4f, %.4f\n",
+			current[0].tId, current[1].tId, current[0].tDown, current[1].tDown,
+			current[0].tX, current[0].tY, current[1].tX, current[1].tY);
+
+		// Do I need to check for matching IDs here?
+		// DS4 consistently sends the same touch ID in the same array position until released.
+
+		touch_point[0].posX = current[0].tDown ? current[0].tX / 1920.0f : -1.f; // Absolute position in percentage
+		touch_point[0].posY = current[0].tDown ? current[0].tY / 943.0f : -1.f;
+		touch_point[0].movX = prev_touch_state[0].tDown ? current[0].tX - prev_touch_state[0].tX : 0.f; // Relative movement in unit
+		touch_point[0].movY = prev_touch_state[0].tDown ? current[0].tY - prev_touch_state[0].tY : 0.f;
+
+		touch_point[1].posX = current[1].tDown ? current[1].tX / 1920.0f : -1.f;
+		touch_point[1].posY = current[1].tDown ? current[1].tY / 943.0f : -1.f;
+		touch_point[1].movX = prev_touch_state[1].tDown ? current[1].tX - prev_touch_state[1].tX : 0.f;
+		touch_point[1].movY = prev_touch_state[1].tDown ? current[1].tY - prev_touch_state[1].tY : 0.f;
+
+		prev_touch_state = current;  // Keep for differences next callback
+
+
+		if (use_continuous_calibration) {
+			push_sensor_samples(imu_state.gyroX, imu_state.gyroY, imu_state.gyroZ,
+				sqrtf(imu_state.accelX * imu_state.accelX + imu_state.accelY * imu_state.accelY + imu_state.accelZ * imu_state.accelZ));
+			get_average_gyro(offset_x, offset_y, offset_z, accel_magnitude);
+		}
+
+		imu_state.gyroX -= offset_x;
+		imu_state.gyroY -= offset_y;
+		imu_state.gyroZ -= offset_z;
 	}
 };

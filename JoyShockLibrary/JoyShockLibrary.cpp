@@ -13,10 +13,12 @@
 #include "JoyShock.cpp"
 #include "InputHelpers.cpp"
 
+steam_controller::context SteamController::_scContext = steam_controller::context();
+
 std::shared_timed_mutex _callbackLock;
 void(*_pollCallback)(int, JOY_SHOCK_STATE, JOY_SHOCK_STATE, IMU_STATE, IMU_STATE, float) = nullptr;
 void(*_pollTouchCallback)(int, TOUCH_POINT, TOUCH_POINT, float) = nullptr;
-std::unordered_map<int, JoyShock*> _joyshocks;
+std::unordered_map<int, Controller*> _joyshocks;
 // https://stackoverflow.com/questions/41206861/atomic-increment-and-return-counter
 static std::atomic<int> _joyshockHandleCounter;
 static int GetUniqueHandle()
@@ -25,7 +27,7 @@ static int GetUniqueHandle()
 }
 
 // https://stackoverflow.com/questions/25144887/map-unordered-map-prefer-find-and-then-at-or-try-at-catch-out-of-range
-static JoyShock* GetJoyShockFromHandle(int handle) {
+static Controller* GetJoyShockFromHandle(int handle) {
 	auto iter = _joyshocks.find(handle);
 
 	if (iter != _joyshocks.end())
@@ -36,7 +38,87 @@ static JoyShock* GetJoyShockFromHandle(int handle) {
 	return nullptr;
 }
 
-void pollIndividualLoop(JoyShock *jc) {
+void pollIndividualLoopSteam(SteamController *jc) {
+	steam_controller::event event {};
+	bool hasIMU = true;
+	int numNoIMU = 0;
+	int noIMULimit = 250;
+	unsigned char buf[65];
+	memset(buf, 0, 65);
+	while (!jc->cancel_thread) {
+		auto state_before = jc->_sc->state();
+
+		jc->_sc->poll(event);
+
+		auto state = jc->_sc->state();
+		if (state == steam_controller::connection_state::disconnected)
+		{
+			// Note: controllers that are never attached will still appear as disconnected.
+			// Need to keep searching for one that is connected!
+			std::cout << "Steam Controller disconnected\n";
+			break;
+		}
+
+		if (state == steam_controller::connection_state::connected && state_before != steam_controller::connection_state::connected)
+		{
+			std::cout << "Steam Controller connected\n";
+		}
+
+		if (event.key == steam_controller::event_key::UPDATE)
+		{
+			jc->update(event.update, hasIMU);
+			if (hasIMU)
+			{
+				if (jc->cue_motion_reset)
+				{
+					//printf("RESET motion\n");
+					jc->cue_motion_reset = false;
+					jc->motion.Reset();
+				}
+				jc->motion.Update(jc->imu_state.gyroX, jc->imu_state.gyroY, jc->imu_state.gyroZ,
+					jc->imu_state.accelX, jc->imu_state.accelY, jc->imu_state.accelZ,
+					jc->accel_magnitude, jc->delta_time);
+				//printf("gyro %.4f, %.4f, %.4f ... accel %.4f, %.4f, %.4f ... local accel %.4f, %.4f, %.4f ... grav %.4f, %.4f, %.4f ... quat %.4f, %.4f, %.4f, %.4f\n",
+				//	jc->imu_state.gyroX, jc->imu_state.gyroY, jc->imu_state.gyroZ,
+				//	jc->imu_state.accelX, jc->imu_state.accelY, jc->imu_state.accelZ,
+				//	jc->motion.Accel.x, jc->motion.Accel.y, jc->motion.Accel.z,
+				//	jc->motion.Grav.x, jc->motion.Grav.y, jc->motion.Grav.z,
+				//	jc->motion.Quaternion.w, jc->motion.Quaternion.x, jc->motion.Quaternion.y, jc->motion.Quaternion.z);
+			}
+			// else, no IMU processing required
+
+			if (_pollCallback != nullptr || _pollTouchCallback != nullptr)
+			{
+				_callbackLock.lock_shared();
+				if (_pollCallback != nullptr) {
+					_pollCallback(jc->intHandle, jc->simple_state, jc->last_simple_state, jc->imu_state, jc->last_imu_state, jc->delta_time);
+				}
+				// touchpad will have its own callback so that it doesn't change the existing api
+				if (jc->is_ds4 && _pollTouchCallback != nullptr) {
+					_pollTouchCallback(jc->intHandle, jc->touch_point[0], jc->touch_point[1], jc->delta_time);
+				}
+				_callbackLock.unlock_shared();
+			}
+			// count how many have no IMU result. We want to periodically attempt to enable IMU if it's not present
+			if (!hasIMU)
+			{
+				numNoIMU++;
+				if (numNoIMU == noIMULimit)
+				{
+					jc->enable_IMU(buf, 65);
+					numNoIMU = 0;
+				}
+			}
+			else
+			{
+				numNoIMU = 0;
+			}
+
+		}
+	}
+}
+
+void pollIndividualLoopJoyShock(JoyShock *jc) {
 	if (!jc->handle) { return; }
 
 	hid_set_nonblocking(jc->handle, 0);
@@ -87,7 +169,7 @@ void pollIndividualLoop(JoyShock *jc) {
 				{
 					if (jc->is_usb)
 					{
-						printf("Attempting to re-initialise controller %d\n", jc->handle);
+						printf("Attempting to re-initialise sc %d\n", jc->handle);
 						if (jc->init_usb())
 						{
 							numTimeOuts = 0;
@@ -95,7 +177,7 @@ void pollIndividualLoop(JoyShock *jc) {
 					}
 					else
 					{
-						printf("Attempting to re-initialise controller %d\n", jc->handle);
+						printf("Attempting to re-initialise sc %d\n", jc->handle);
 						if (jc->init_bt())
 						{
 							numTimeOuts = 0;
@@ -204,20 +286,20 @@ int JslConnectDevices()
 			// bluetooth, left / right joycon:
 			if (cur_dev->product_id == JOYCON_L_BT || cur_dev->product_id == JOYCON_R_BT) {
 				//printf("JOYCON\n");
-				JoyShock* jc = new JoyShock(cur_dev, GetUniqueHandle());
+				Controller* jc = new JoyShock(cur_dev, GetUniqueHandle());
 				_joyshocks.emplace(jc->intHandle, jc);
 			}
 
 			// pro controller:
 			if (cur_dev->product_id == PRO_CONTROLLER) {
-				JoyShock* jc = new JoyShock(cur_dev, GetUniqueHandle());
+				Controller* jc = new JoyShock(cur_dev, GetUniqueHandle());
 				//printf("PRO\n");
 				_joyshocks.emplace(jc->intHandle, jc);
 			}
 
 			// charging grip:
 			if (cur_dev->product_id == JOYCON_CHARGING_GRIP) {
-				JoyShock* jc = new JoyShock(cur_dev, GetUniqueHandle());
+				Controller* jc = new JoyShock(cur_dev, GetUniqueHandle());
 				//printf("GRIP\n");
 				_joyshocks.emplace(jc->intHandle, jc);
 			}
@@ -241,7 +323,7 @@ int JslConnectDevices()
 				cur_dev->product_id == DS4_USB_V2 ||
 				cur_dev->product_id == DS4_USB_DONGLE ||
 				cur_dev->product_id == DS4_BT) {
-				JoyShock* jc = new JoyShock(cur_dev, GetUniqueHandle());
+				Controller* jc = new JoyShock(cur_dev, GetUniqueHandle());
 				_joyshocks.emplace(jc->intHandle, jc);
 			}
 		}
@@ -268,10 +350,30 @@ int JslConnectDevices()
 	}
 	hid_free_enumeration(devs);
 
-	// init joyshocks:
-	for (std::pair<int, JoyShock*> pair : _joyshocks)
+	// find Steam Controllers
+	for (auto device : SteamController::_scContext.enumerate())
 	{
-		JoyShock* jc = pair.second;
+		auto steamController = SteamController::_scContext.connect(device, 0, std::chrono::milliseconds(500));
+		if (steamController)
+		{
+			steam_controller::event event {};
+			auto state_before = steamController->state();
+			steamController->poll(event);
+			auto state = steamController->state();
+			if (state_before != steam_controller::connection_state::connected &&
+				state == steam_controller::connection_state::connected)
+			{
+				Controller* jc = new SteamController(steamController, GetUniqueHandle(), device.wireless);
+				_joyshocks.emplace(jc->intHandle, jc);
+			}
+		}
+	}
+
+	// init joyshocks:
+	for (std::pair<int, Controller*> pair : _joyshocks)
+	{
+		auto jc = dynamic_cast<JoyShock*>(pair.second);
+		if (!jc) continue;
 		if (jc->controller_type == ControllerType::s_ds4) {
 			if (!jc->is_usb) {
 				jc->init_ds4_bt();
@@ -303,10 +405,10 @@ int JslConnectDevices()
 	// set lights:
 	//printf("setting LEDs...\n");
 	int i = 0;
-	for (std::pair<int, JoyShock*> pair : _joyshocks)
+	for (std::pair<int, Controller*> pair : _joyshocks)
 	{
-		JoyShock *jc = pair.second;
-		if (jc->controller_type != ControllerType::n_switch) {
+		Controller *jc = pair.second;
+		if (jc->is_ds4) {
 			// don't do joycon LED stuff with DS4
 			continue;
 		}
@@ -319,11 +421,21 @@ int JslConnectDevices()
 	}
 
 	// now let's get polling!
-	for (std::pair<int, JoyShock*> pair : _joyshocks)
+	for (std::pair<int, Controller*> pair : _joyshocks)
 	{
-		JoyShock* jc = pair.second;
-		// threads for polling
-		jc->thread = new std::thread(pollIndividualLoop, jc);
+		auto jc = dynamic_cast<JoyShock *>(pair.second);
+		if (jc)
+		{
+			// threads for polling
+			jc->thread = new std::thread(pollIndividualLoopJoyShock, jc);
+			continue;
+		}
+		auto sc = dynamic_cast<SteamController *>(pair.second);
+		if (sc)
+		{
+			sc->thread = new std::thread(pollIndividualLoopSteam, sc);
+			continue;
+		}
 	}
 
 	return _joyshocks.size();
@@ -332,7 +444,7 @@ int JslConnectDevices()
 int JslGetConnectedDeviceHandles(int* deviceHandleArray, int size)
 {
 	int i = 0;
-	for (std::pair<int, JoyShock*> pair : _joyshocks)
+	for (std::pair<int, Controller*> pair : _joyshocks)
 	{
 		if (i >= size) {
 			break;
@@ -348,13 +460,13 @@ void JslDisconnectAndDisposeAll()
 	// no more callback
 	JslSetCallback(nullptr);
 
-	for (std::pair<int, JoyShock*> pair : _joyshocks)
+	for (std::pair<int, Controller*> pair : _joyshocks)
 	{
-		JoyShock* jc = pair.second;
+		Controller* jc = pair.second;
 		// threads for polling
 		jc->cancel_thread = true;
 		jc->thread->join();
-		if (jc->controller_type == ControllerType::s_ds4) {
+		if (jc->is_ds4) {
 			if (jc->is_usb) {
 				jc->deinit_ds4_usb();
 			}
@@ -365,7 +477,7 @@ void JslDisconnectAndDisposeAll()
 		else if (jc->controller_type == ControllerType::s_ds) {
 
 		} // TODO: Charging grip? bluetooth?
-		else if (jc->is_usb) {
+		else if (jc && jc->is_usb) {
 			jc->deinit_usb();
 		}
 		  // cleanup
@@ -402,7 +514,7 @@ void JslDisconnectAndDisposeAll()
 // if you want the whole state, this is the best way to do it
 JOY_SHOCK_STATE JslGetSimpleState(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->simple_state;
 	}
@@ -410,7 +522,7 @@ JOY_SHOCK_STATE JslGetSimpleState(int deviceId)
 }
 IMU_STATE JslGetIMUState(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->imu_state;
 	}
@@ -418,7 +530,7 @@ IMU_STATE JslGetIMUState(int deviceId)
 }
 MOTION_STATE JslGetMotionState(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->get_motion_state();
 	}
@@ -426,7 +538,7 @@ MOTION_STATE JslGetMotionState(int deviceId)
 }
 TOUCH_POINT JslGetTouchPoint(int deviceId, int touchIndex)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr && touchIndex < jc->touch_point.size()) {
 		return jc->touch_point[touchIndex];
 	}
@@ -435,7 +547,7 @@ TOUCH_POINT JslGetTouchPoint(int deviceId, int touchIndex)
 
 int JslGetButtons(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->simple_state.buttons;
 	}
@@ -445,7 +557,7 @@ int JslGetButtons(int deviceId)
 // get thumbsticks
 float JslGetLeftX(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->simple_state.stickLX;
 	}
@@ -453,7 +565,7 @@ float JslGetLeftX(int deviceId)
 }
 float JslGetLeftY(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->simple_state.stickLY;
 	}
@@ -461,7 +573,7 @@ float JslGetLeftY(int deviceId)
 }
 float JslGetRightX(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->simple_state.stickRX;
 	}
@@ -469,7 +581,7 @@ float JslGetRightX(int deviceId)
 }
 float JslGetRightY(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->simple_state.stickRY;
 	}
@@ -479,7 +591,7 @@ float JslGetRightY(int deviceId)
 // get triggers. Switch controllers don't have analogue triggers, but will report 0.0 or 1.0 so they can be used in the same way as others
 float JslGetLeftTrigger(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->simple_state.lTrigger;
 	}
@@ -487,7 +599,7 @@ float JslGetLeftTrigger(int deviceId)
 }
 float JslGetRightTrigger(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->simple_state.rTrigger;
 	}
@@ -497,7 +609,7 @@ float JslGetRightTrigger(int deviceId)
 // get gyro
 float JslGetGyroX(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->imu_state.gyroX;
 	}
@@ -505,7 +617,7 @@ float JslGetGyroX(int deviceId)
 }
 float JslGetGyroY(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->imu_state.gyroY;
 	}
@@ -513,7 +625,7 @@ float JslGetGyroY(int deviceId)
 }
 float JslGetGyroZ(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->imu_state.gyroZ;
 	}
@@ -523,7 +635,7 @@ float JslGetGyroZ(int deviceId)
 // get accelerometor
 float JslGetAccelX(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->imu_state.accelX;
 	}
@@ -531,7 +643,7 @@ float JslGetAccelX(int deviceId)
 }
 float JslGetAccelY(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->imu_state.accelY;
 	}
@@ -539,7 +651,7 @@ float JslGetAccelY(int deviceId)
 }
 float JslGetAccelZ(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->imu_state.accelZ;
 	}
@@ -549,7 +661,7 @@ float JslGetAccelZ(int deviceId)
 // analog parameters have different resolutions depending on device
 float JslGetStickStep(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		if (jc->controller_type != ControllerType::n_switch) {
 			return 1.0 / 128.0;
@@ -568,7 +680,7 @@ float JslGetStickStep(int deviceId)
 }
 float JslGetTriggerStep(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->controller_type != ControllerType::n_switch ? 1 / 256.0 : 1.0;
 	}
@@ -576,7 +688,7 @@ float JslGetTriggerStep(int deviceId)
 }
 float JslGetPollRate(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->controller_type != ControllerType::n_switch ? 250.0 : 66.6667;
 	}
@@ -585,7 +697,7 @@ float JslGetPollRate(int deviceId)
 
 // calibration
 void JslResetContinuousCalibration(int deviceId) {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		// TODO: might need a lock around this to prevent race conditions.
 		// risk of miscounting samples
@@ -593,20 +705,20 @@ void JslResetContinuousCalibration(int deviceId) {
 	}
 }
 void JslStartContinuousCalibration(int deviceId) {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		jc->use_continuous_calibration = true;
 		jc->cue_motion_reset = true;
 	}
 }
 void JslPauseContinuousCalibration(int deviceId) {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		jc->use_continuous_calibration = false;
 	}
 }
 void JslGetCalibrationOffset(int deviceId, float& xOffset, float& yOffset, float& zOffset) {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		xOffset = jc->offset_x;
 		yOffset = jc->offset_y;
@@ -614,7 +726,7 @@ void JslGetCalibrationOffset(int deviceId, float& xOffset, float& yOffset, float
 	}
 }
 void JslSetCalibrationOffset(int deviceId, float xOffset, float yOffset, float zOffset) {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		jc->offset_x = xOffset;
 		jc->offset_y = yOffset;
@@ -640,7 +752,7 @@ void JslSetTouchCallback(void(*callback)(int, TOUCH_POINT, TOUCH_POINT, float)) 
 // what split type of controller is this?
 int JslGetControllerType(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		switch (jc->controller_type)
 		{
@@ -658,7 +770,7 @@ int JslGetControllerType(int deviceId)
 // what split type of controller is this?
 int JslGetControllerSplitType(int deviceId)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->left_right;
 	}
@@ -668,7 +780,7 @@ int JslGetControllerSplitType(int deviceId)
 int JslGetControllerColour(int deviceId)
 {
 	// this just reports body colour. Switch controllers also give buttons colour, and in Pro's case, left and right grips
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr) {
 		return jc->body_colour;
 	}
@@ -677,7 +789,7 @@ int JslGetControllerColour(int deviceId)
 // set controller light colour (not all controllers have a light whose colour can be set, but that just means nothing will be done when this is called -- no harm)
 void JslSetLightColour(int deviceId, int colour)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr && jc->controller_type == ControllerType::s_ds4) {
 		jc->led_r = (colour >> 16) & 0xff;
 		jc->led_g = (colour >> 8) & 0xff;
@@ -693,7 +805,7 @@ void JslSetLightColour(int deviceId, int colour)
 // set controller rumble
 void JslSetRumble(int deviceId, int smallRumble, int bigRumble)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr && jc->controller_type == ControllerType::s_ds4) {
 		jc->small_rumble = smallRumble;
 		jc->big_rumble = bigRumble;
@@ -708,12 +820,20 @@ void JslSetRumble(int deviceId, int smallRumble, int bigRumble)
 // set controller player number indicator (not all controllers have a number indicator which can be set, but that just means nothing will be done when this is called -- no harm)
 void JslSetPlayerNumber(int deviceId, int number)
 {
-	JoyShock* jc = GetJoyShockFromHandle(deviceId);
+	Controller* jc = GetJoyShockFromHandle(deviceId);
 	if (jc != nullptr && jc->controller_type == ControllerType::n_switch) {
 		jc->player_number = number;
 		unsigned char buf[64];
 		memset(buf, 0x00, 0x40);
 		buf[0] = (unsigned char)number;
 		jc->send_subcommand(0x01, 0x30, buf, 1);
+	}
+}
+
+void JslPlayMusic(int deviceId, int number)
+{
+	auto sc = dynamic_cast<SteamController*>(GetJoyShockFromHandle(deviceId));
+	if (sc != nullptr) {
+		sc->_sc->play_melody(number);
 	}
 }

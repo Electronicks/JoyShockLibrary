@@ -120,8 +120,8 @@ bool handle_input(JoyShock *jc, uint8_t *packet, int len, bool &hasIMU) {
 			jc->simple_state.rTrigger = packet[indexOffset+9] / 255.0f;
 			jc->simple_state.lTrigger = packet[indexOffset+8] / 255.0f;
 
-			if (jc->simple_state.rTrigger > 0.0) jc->simple_state.buttons |= JSMASK_ZR;
-			if (jc->simple_state.lTrigger > 0.0) jc->simple_state.buttons |= JSMASK_ZL;
+			if (jc->simple_state.rTrigger >= 1.0) jc->simple_state.buttons |= JSMASK_ZR;
+			if (jc->simple_state.lTrigger >= 1.0) jc->simple_state.buttons |= JSMASK_ZL;
 
 			uint16_t stick_x = packet[indexOffset+1];
 			uint16_t stick_y = packet[indexOffset+2];

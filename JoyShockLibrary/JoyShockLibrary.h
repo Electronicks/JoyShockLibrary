@@ -12,6 +12,7 @@
 #define JS_TYPE_PRO_CONTROLLER 3
 #define JS_TYPE_DS4 4
 #define JS_TYPE_DS 5
+#define JS_TYPE_STEAM_CONTROLLER 6
 
 #define JS_SPLIT_TYPE_LEFT 1
 #define JS_SPLIT_TYPE_RIGHT 2
@@ -197,3 +198,5 @@ extern "C" JOY_SHOCK_API void JslSetLightColour(int deviceId, int colour);
 extern "C" JOY_SHOCK_API void JslSetRumble(int deviceId, int smallRumble, int bigRumble);
 // set controller player number indicator (not all controllers have a number indicator which can be set, but that just means nothing will be done when this is called -- no harm)
 extern "C" JOY_SHOCK_API void JslSetPlayerNumber(int deviceId, int number);
+// Use haptics (or speakers? TODO) to play a prerecorded melody
+extern "C" JOY_SHOCK_API void JslPlayMusic(int deviceId, int number);
