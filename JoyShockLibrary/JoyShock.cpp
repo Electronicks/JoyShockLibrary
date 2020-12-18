@@ -1602,7 +1602,7 @@ public:
 	bool init_bt() { throw std::exception("Not Implemented"); }
 	void init_ds4_bt() { throw std::exception("Not Implemented"); }
 	void init_ds4_usb() { throw std::exception("Not Implemented"); }
-	void deinit_ds4_bt() { throw std::exception("Not Implemented"); };
+	void deinit_ds4_bt() {  };
 	void deinit_ds4_usb() { throw std::exception("Not Implemented"); };
 	void deinit_usb() { throw std::exception("Not Implemented"); };
 	void enable_IMU(unsigned char *reportData, int bufLength) override

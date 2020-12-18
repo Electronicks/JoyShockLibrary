@@ -353,19 +353,25 @@ int JslConnectDevices()
 	// find Steam Controllers
 	for (auto device : SteamController::_scContext.enumerate())
 	{
-		auto steamController = SteamController::_scContext.connect(device, 0, std::chrono::milliseconds(500));
+		auto steamController = SteamController::_scContext.connect(device, 0, std::chrono::milliseconds(5000));
 		if (steamController)
 		{
 			steam_controller::event event {};
+			steam_controller::connection_state state;
 			auto state_before = steamController->state();
-			steamController->poll(event);
-			auto state = steamController->state();
-			if (state_before != steam_controller::connection_state::connected &&
-				state == steam_controller::connection_state::connected)
-			{
-				Controller* jc = new SteamController(steamController, GetUniqueHandle(), device.wireless);
-				_joyshocks.emplace(jc->intHandle, jc);
+			do {
+				steamController->poll(event);
+				state = steamController->state();
+				if (state_before != steam_controller::connection_state::connected &&
+					state == steam_controller::connection_state::connected)
+				{
+					Controller* jc = new SteamController(steamController, GetUniqueHandle(), device.wireless);
+					_joyshocks.emplace(jc->intHandle, jc);
+					break;
+				}
+				state_before = state;
 			}
+			while (state != steam_controller::connection_state::disconnected);
 		}
 	}
 
