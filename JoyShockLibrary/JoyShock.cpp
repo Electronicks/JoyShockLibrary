@@ -1590,6 +1590,7 @@ public:
 	{
 		is_ds4 = true;
 		left_right = 3;
+		controller_type = ControllerType::s_sc;
 
 		name = std::string("Steam Controller");
 		is_usb = !wireless;
@@ -1702,13 +1703,13 @@ public:
 
 		current[0].tDown = update.buttons & int(Button::LFINGER);
 		current[0].tId = int(Button::LPAD);
-		current[0].tX = (update.left_axis.x - INT16_MIN) / float(UINT16_MAX);
-		current[0].tY = 1 - (update.left_axis.y - INT16_MIN) / float(UINT16_MAX);
+		current[0].tX = update.left_axis.x;
+		current[0].tY = update.left_axis.y;
 
 		current[1].tDown = update.buttons & int(Button::RFINGER);
 		current[1].tId = int(Button::RPAD);
-		current[1].tX = (update.right_axis.x - INT16_MIN) / float(UINT16_MAX);
-		current[1].tY = 1 - (update.right_axis.y - INT16_MIN) / float(UINT16_MAX);
+		current[1].tX = update.right_axis.x;
+		current[1].tY = update.right_axis.y;
 
 		printf("SC touch: %d, %d, %d, %d, %.4f, %.4f, %.4f, %.4f\n",
 			current[0].tId, current[1].tId, current[0].tDown, current[1].tDown,
@@ -1717,13 +1718,13 @@ public:
 		// Do I need to check for matching IDs here?
 		// DS4 consistently sends the same touch ID in the same array position until released.
 
-		touch_point[0].posX = current[0].tDown ? current[0].tX / 1920.0f : -1.f; // Absolute position in percentage
-		touch_point[0].posY = current[0].tDown ? current[0].tY / 943.0f : -1.f;
+		touch_point[0].posX = current[0].tDown ? (current[0].tX - INT16_MIN) / float(UINT16_MAX) : -1.f; // Absolute position in percentage
+		touch_point[0].posY = current[0].tDown ? 1 - (current[0].tY - INT16_MIN) / float(UINT16_MAX) : -1.f;
 		touch_point[0].movX = prev_touch_state[0].tDown ? current[0].tX - prev_touch_state[0].tX : 0.f; // Relative movement in unit
 		touch_point[0].movY = prev_touch_state[0].tDown ? current[0].tY - prev_touch_state[0].tY : 0.f;
 
-		touch_point[1].posX = current[1].tDown ? current[1].tX / 1920.0f : -1.f;
-		touch_point[1].posY = current[1].tDown ? current[1].tY / 943.0f : -1.f;
+		touch_point[1].posX = current[1].tDown ? (current[1].tX - INT16_MIN) / float(UINT16_MAX) : -1.f;
+		touch_point[1].posY = current[1].tDown ? 1 - (current[1].tY - INT16_MIN) / float(UINT16_MAX) : -1.f;
 		touch_point[1].movX = prev_touch_state[1].tDown ? current[1].tX - prev_touch_state[1].tX : 0.f;
 		touch_point[1].movY = prev_touch_state[1].tDown ? current[1].tY - prev_touch_state[1].tY : 0.f;
 

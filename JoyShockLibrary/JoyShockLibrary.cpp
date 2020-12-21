@@ -766,6 +766,8 @@ int JslGetControllerType(int deviceId)
 			return JS_TYPE_DS4;
 		case ControllerType::s_ds:
 			return JS_TYPE_DS;
+		case ControllerType::s_sc:
+			return JS_TYPE_STEAM_CONTROLLER;
 		default:
 		case ControllerType::n_switch:
 			return jc->left_right;
